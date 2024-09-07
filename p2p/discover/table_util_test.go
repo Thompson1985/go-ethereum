@@ -30,6 +30,7 @@ import (
 	"time"
 
 	"github.com/ethereum/go-ethereum/crypto"
+	"github.com/ethereum/go-ethereum/p2p/discover/v4wire"
 	"github.com/ethereum/go-ethereum/p2p/enode"
 	"github.com/ethereum/go-ethereum/p2p/enr"
 )
@@ -43,25 +44,31 @@ func init() {
 }
 
 func newTestTable(t transport, cfg Config) (*Table, *enode.DB) {
-	db, _ := enode.OpenDB("")
-	tab, _ := newTable(t, db, cfg)
+	tab, db := newInactiveTestTable(t, cfg)
 	go tab.loop()
 	return tab, db
 }
 
+// newInactiveTestTable creates a Table without running the main loop.
+func newInactiveTestTable(t transport, cfg Config) (*Table, *enode.DB) {
+	db, _ := enode.OpenDB("")
+	tab, _ := newTable(t, db, cfg)
+	return tab, db
+}
+
 // nodeAtDistance creates a node for which enode.LogDist(base, n.id) == ld.
-func nodeAtDistance(base enode.ID, ld int, ip net.IP) *node {
+func nodeAtDistance(base enode.ID, ld int, ip net.IP) *enode.Node {
 	var r enr.Record
 	r.Set(enr.IP(ip))
 	r.Set(enr.UDP(30303))
-	return wrapNode(enode.SignNull(&r, idAtDistance(base, ld)))
+	return enode.SignNull(&r, idAtDistance(base, ld))
 }
 
 // nodesAtDistance creates n nodes for which enode.LogDist(base, node.ID()) == ld.
 func nodesAtDistance(base enode.ID, ld int, n int) []*enode.Node {
 	results := make([]*enode.Node, n)
 	for i := range results {
-		results[i] = unwrapNode(nodeAtDistance(base, ld, intIP(i)))
+		results[i] = nodeAtDistance(base, ld, intIP(i))
 	}
 	return results
 }
@@ -94,17 +101,18 @@ func idAtDistance(a enode.ID, n int) (b enode.ID) {
 	return b
 }
 
+// intIP returns a LAN IP address based on i.
 func intIP(i int) net.IP {
-	return net.IP{byte(i), 0, 2, byte(i)}
+	return net.IP{10, 0, byte(i >> 8), byte(i & 0xFF)}
 }
 
 // fillBucket inserts nodes into the given bucket until it is full.
-func fillBucket(tab *Table, id enode.ID) (last *node) {
+func fillBucket(tab *Table, id enode.ID) (last *tableNode) {
 	ld := enode.LogDist(tab.self().ID(), id)
 	b := tab.bucket(id)
 	for len(b.entries) < bucketSize {
 		node := nodeAtDistance(tab.self().ID(), ld, intIP(ld))
-		if !tab.addFoundNode(node) {
+		if !tab.addFoundNode(node, false) {
 			panic("node not added")
 		}
 	}
@@ -113,13 +121,9 @@ func fillBucket(tab *Table, id enode.ID) (last *node) {
 
 // fillTable adds nodes the table to the end of their corresponding bucket
 // if the bucket is not full. The caller must not hold tab.mutex.
-func fillTable(tab *Table, nodes []*node, setLive bool) {
+func fillTable(tab *Table, nodes []*enode.Node, setLive bool) {
 	for _, n := range nodes {
-		if setLive {
-			n.livenessChecks = 1
-			n.isValidatedLive = true
-		}
-		tab.addFoundNode(n)
+		tab.addFoundNode(n, setLive)
 	}
 }
 
@@ -213,7 +217,7 @@ func (t *pingRecorder) RequestENR(n *enode.Node) (*enode.Node, error) {
 	return t.records[n.ID()], nil
 }
 
-func hasDuplicates(slice []*node) bool {
+func hasDuplicates(slice []*enode.Node) bool {
 	seen := make(map[enode.ID]bool, len(slice))
 	for i, e := range slice {
 		if e == nil {
@@ -252,17 +256,17 @@ NotEqual:
 }
 
 func nodeEqual(n1 *enode.Node, n2 *enode.Node) bool {
-	return n1.ID() == n2.ID() && n1.IP().Equal(n2.IP())
+	return n1.ID() == n2.ID() && n1.IPAddr() == n2.IPAddr()
 }
 
-func sortByID(nodes []*enode.Node) {
-	slices.SortFunc(nodes, func(a, b *enode.Node) int {
+func sortByID[N nodeType](nodes []N) {
+	slices.SortFunc(nodes, func(a, b N) int {
 		return bytes.Compare(a.ID().Bytes(), b.ID().Bytes())
 	})
 }
 
-func sortedByDistanceTo(distbase enode.ID, slice []*node) bool {
-	return slices.IsSortedFunc(slice, func(a, b *node) int {
+func sortedByDistanceTo(distbase enode.ID, slice []*enode.Node) bool {
+	return slices.IsSortedFunc(slice, func(a, b *enode.Node) int {
 		return enode.DistCmp(distbase, a.ID(), b.ID())
 	})
 }
@@ -281,7 +285,7 @@ func hexEncPrivkey(h string) *ecdsa.PrivateKey {
 }
 
 // hexEncPubkey decodes h as a public key.
-func hexEncPubkey(h string) (ret encPubkey) {
+func hexEncPubkey(h string) (ret v4wire.Pubkey) {
 	b, err := hex.DecodeString(h)
 	if err != nil {
 		panic(err)
@@ -298,7 +302,7 @@ type nodeEventRecorder struct {
 }
 
 type recordedNodeEvent struct {
-	node  *node
+	node  *tableNode
 	added bool
 }
 
@@ -308,7 +312,7 @@ func newNodeEventRecorder(buffer int) *nodeEventRecorder {
 	}
 }
 
-func (set *nodeEventRecorder) nodeAdded(b *bucket, n *node) {
+func (set *nodeEventRecorder) nodeAdded(b *bucket, n *tableNode) {
 	select {
 	case set.evc <- recordedNodeEvent{n, true}:
 	default:
@@ -316,7 +320,7 @@ func (set *nodeEventRecorder) nodeAdded(b *bucket, n *node) {
 	}
 }
 
-func (set *nodeEventRecorder) nodeRemoved(b *bucket, n *node) {
+func (set *nodeEventRecorder) nodeRemoved(b *bucket, n *tableNode) {
 	select {
 	case set.evc <- recordedNodeEvent{n, false}:
 	default:
